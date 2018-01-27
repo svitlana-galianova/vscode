@@ -632,13 +632,13 @@ export class FeedbackWidgetRenderer extends Disposable {
 
 		const result = this._currentResult;
 		const metadata = result.metadata['nlpResult']; // Feedback only on nlpResult set for now
-		const marketplaceExtensionsResults = result.metadata['newExtensionsResult'] && result.metadata['newExtensionsResult'].scoredResults;
 		const actualResults = metadata ? metadata.scoredResults : {};
 		const actualResultIds = Object.keys(actualResults);
 
 		const feedbackQuery: any = {};
 		feedbackQuery['comment'] = FeedbackWidgetRenderer.DEFAULT_COMMENT_TEXT;
 		feedbackQuery['queryString'] = result.query;
+		feedbackQuery['duration'] = metadata ? metadata.duration : -1;
 		feedbackQuery['resultScores'] = [];
 		actualResultIds.forEach(settingId => {
 			feedbackQuery['resultScores'].push({
@@ -649,17 +649,21 @@ export class FeedbackWidgetRenderer extends Disposable {
 		});
 		feedbackQuery['alts'] = [];
 
+		const groupCountsText = result.filteredGroups
+			.map(group => `// ${group.id}: ${group.sections[0].settings.length}`)
+			.join('\n');
+
 		const contents = FeedbackWidgetRenderer.INSTRUCTION_TEXT + '\n' +
 			JSON.stringify(feedbackQuery, undefined, '    ') + '\n\n' +
 			this.getScoreText(actualResults) + '\n\n' +
-			this.getScoreText(marketplaceExtensionsResults) + '\n';
+			groupCountsText + '\n';
 
 		this.editorService.openEditor({ contents, language: 'jsonc' }, /*sideBySide=*/true).then(feedbackEditor => {
 			const sendFeedbackWidget = this._register(this.instantiationService.createInstance(FloatingClickWidget, feedbackEditor.getControl(), 'Send feedback', null));
 			sendFeedbackWidget.render();
 
 			this._register(sendFeedbackWidget.onClick(() => {
-				this.sendFeedback(feedbackEditor.getControl() as ICodeEditor, result, metadata.scoredResults).then(() => {
+				this.sendFeedback(feedbackEditor.getControl() as ICodeEditor, result, actualResults).then(() => {
 					sendFeedbackWidget.dispose();
 					this.messageService.show(Severity.Info, 'Feedback sent successfully');
 				}, err => {
@@ -711,7 +715,7 @@ export class FeedbackWidgetRenderer extends Disposable {
 				"userComment" : { "classification": "CustomerContent", "purpose": "FeatureInsight" },
 				"expectedResults" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
 				"actualResults" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
-				"duration" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+				"duration" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" }
 			}
 		*/
 		return this.telemetryService.publicLog('settingsSearchResultFeedback', {

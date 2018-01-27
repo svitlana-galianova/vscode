@@ -9,8 +9,9 @@ import URI from 'vs/base/common/uri';
 import { onUnexpectedError, isPromiseCanceledError, getErrorMessage } from 'vs/base/common/errors';
 import * as DOM from 'vs/base/browser/dom';
 import { Delayer, ThrottledDelayer } from 'vs/base/common/async';
+import * as arrays from 'vs/base/common/arrays';
 import { Dimension, Builder } from 'vs/base/browser/builder';
-import { ArrayNavigator, INavigator } from 'vs/base/common/iterator';
+import { ArrayNavigator } from 'vs/base/common/iterator';
 import { Disposable, IDisposable, dispose } from 'vs/base/common/lifecycle';
 import { KeyMod, KeyCode } from 'vs/base/common/keyCodes';
 import { SideBySideEditorInput, EditorOptions, EditorInput } from 'vs/workbench/common/editor';
@@ -221,6 +222,7 @@ export class PreferencesEditor extends BaseEditor {
 	public clearInput(): void {
 		this.defaultSettingsEditorContextKey.set(false);
 		this.sideBySidePreferencesWidget.clearInput();
+		this.preferencesRenderers.onHidden();
 		super.clearInput();
 	}
 
@@ -329,36 +331,18 @@ export class PreferencesEditor extends BaseEditor {
 	}
 }
 
-class SettingsNavigator implements INavigator<ISetting> {
-
-	private iterator: ArrayNavigator<ISetting>;
-
-	constructor(settings: ISetting[]) {
-		this.iterator = new ArrayNavigator<ISetting>(settings);
-	}
+class SettingsNavigator extends ArrayNavigator<ISetting> {
 
 	public next(): ISetting {
-		return this.iterator.next() || this.iterator.first();
+		return super.next() || super.first();
 	}
 
 	public previous(): ISetting {
-		return this.iterator.previous() || this.iterator.last();
+		return super.previous() || super.last();
 	}
 
-	public parent(): ISetting {
-		return this.iterator.parent();
-	}
-
-	public first(): ISetting {
-		return this.iterator.first();
-	}
-
-	public last(): ISetting {
-		return this.iterator.last();
-	}
-
-	public current(): ISetting {
-		return this.iterator.current();
+	public reset(): void {
+		this.index = this.start - 1;
 	}
 }
 
@@ -443,6 +427,11 @@ class PreferencesRenderersController extends Disposable {
 		await this.remoteSearchPreferences(this._lastQuery, true);
 	}
 
+	onHidden(): void {
+		this._prefsModelsForSearch.forEach(model => model.dispose());
+		this._prefsModelsForSearch = new Map<string, ISettingsEditorModel>();
+	}
+
 	remoteSearchPreferences(query: string, updateCurrentResults?: boolean): TPromise<void> {
 		if (this._remoteFilterInProgress && this._remoteFilterInProgress.cancel) {
 			// Resolved/rejected promises have no .cancel()
@@ -465,6 +454,10 @@ class PreferencesRenderersController extends Disposable {
 	}
 
 	localFilterPreferences(query: string, updateCurrentResults?: boolean): TPromise<void> {
+		if (this._settingsNavigator) {
+			this._settingsNavigator.reset();
+		}
+
 		this._currentLocalSearchProvider = (updateCurrentResults && this._currentLocalSearchProvider) || this.preferencesSearchService.getLocalSearchProvider(query);
 		return this.filterOrSearchPreferences(query, this._currentLocalSearchProvider, 'filterResult', nls.localize('filterResult', "Filtered Results"), 0, updateCurrentResults);
 	}
@@ -479,7 +472,7 @@ class PreferencesRenderersController extends Disposable {
 		}
 
 		filterPs.push(this._filterOrSearchPreferences(query, this.editablePreferencesRenderer, searchProvider, groupId, groupLabel, groupOrder),
-			this.updateSettingsTargetCounts(query, searchProvider, groupId, groupLabel, groupOrder));
+			this.searchAllSettingsTargets(query, searchProvider, groupId, groupLabel, groupOrder));
 
 		return TPromise.join(filterPs).then(results => {
 			const [defaultFilterResult, editableFilterResult] = results;
@@ -494,24 +487,30 @@ class PreferencesRenderersController extends Disposable {
 		});
 	}
 
-	private updateSettingsTargetCounts(query: string, searchProvider: ISearchProvider, groupId: string, groupLabel: string, groupOrder: number): TPromise<void> {
+	private searchAllSettingsTargets(query: string, searchProvider: ISearchProvider, groupId: string, groupLabel: string, groupOrder: number): TPromise<void> {
 		const searchPs = [
-			this.searchSettingsTarget(searchProvider, ConfigurationTarget.WORKSPACE, groupId, groupLabel, groupOrder),
-			this.searchSettingsTarget(searchProvider, ConfigurationTarget.USER, groupId, groupLabel, groupOrder)
+			this.searchSettingsTarget(query, searchProvider, ConfigurationTarget.WORKSPACE, groupId, groupLabel, groupOrder),
+			this.searchSettingsTarget(query, searchProvider, ConfigurationTarget.USER, groupId, groupLabel, groupOrder)
 		];
 
 		for (const folder of this.workspaceContextService.getWorkspace().folders) {
 			const folderSettingsResource = this.preferencesService.getFolderSettingsResource(folder.uri);
-			searchPs.push(this.searchSettingsTarget(searchProvider, folderSettingsResource, groupId, groupLabel, groupOrder));
+			searchPs.push(this.searchSettingsTarget(query, searchProvider, folderSettingsResource, groupId, groupLabel, groupOrder));
 		}
 
 
 		return TPromise.join(searchPs).then(() => { });
 	}
 
-	private searchSettingsTarget(provider: ISearchProvider, target: SettingsTarget, groupId: string, groupLabel: string, groupOrder: number): TPromise<void> {
+	private searchSettingsTarget(query: string, provider: ISearchProvider, target: SettingsTarget, groupId: string, groupLabel: string, groupOrder: number): TPromise<void> {
+		if (!query) {
+			// Don't open the other settings targets when query is empty
+			this._onDidFilterResultsCountChange.fire({ target, count: 0 });
+			return TPromise.wrap(null);
+		}
+
 		return this.getPreferencesEditorModel(target).then(model => {
-			return this._filterOrSearchPreferencesModel('', <ISettingsEditorModel>model, provider, groupId, groupLabel, groupOrder);
+			return model && this._filterOrSearchPreferencesModel('', <ISettingsEditorModel>model, provider, groupId, groupLabel, groupOrder);
 		}).then(result => {
 			const count = result ? this._flatten(result.filteredGroups).length : 0;
 			this._onDidFilterResultsCountChange.fire({ target, count });
@@ -531,8 +530,13 @@ class PreferencesRenderersController extends Disposable {
 
 		const targetKey = resource.toString();
 		if (!this._prefsModelsForSearch.has(targetKey)) {
-			const model = this._register(await this.preferencesService.createPreferencesEditorModel(resource));
-			this._prefsModelsForSearch.set(targetKey, <ISettingsEditorModel>model);
+			try {
+				const model = this._register(await this.preferencesService.createPreferencesEditorModel(resource));
+				this._prefsModelsForSearch.set(targetKey, <ISettingsEditorModel>model);
+			} catch (e) {
+				// Will throw when the settings file doesn't exist.
+				return null;
+			}
 		}
 
 		return this._prefsModelsForSearch.get(targetKey);
@@ -615,7 +619,22 @@ class PreferencesRenderersController extends Disposable {
 		const editablePreferencesFilteredGroups = editableFilterResult ? editableFilterResult.filteredGroups : this._getAllPreferences(this._editablePreferencesRenderer);
 		const consolidatedSettings = this._consolidateSettings(editablePreferencesFilteredGroups, defaultPreferencesFilteredGroups);
 
-		this._settingsNavigator = new SettingsNavigator(this._lastQuery ? consolidatedSettings : []);
+		// Maintain the current navigation position when updating SettingsNavigator
+		const current = this._settingsNavigator && this._settingsNavigator.current();
+		const navigatorSettings = this._lastQuery ? consolidatedSettings : [];
+		const currentIndex = current ?
+			arrays.firstIndex(navigatorSettings, s => s.key === current.key) :
+			-1;
+
+		this._settingsNavigator = new SettingsNavigator(navigatorSettings, Math.max(currentIndex, 0));
+
+		if (currentIndex >= 0) {
+			this._settingsNavigator.next();
+			const newCurrent = this._settingsNavigator.current();
+			this._focusPreference(newCurrent, this._defaultPreferencesRenderer);
+			this._focusPreference(newCurrent, this._editablePreferencesRenderer);
+		}
+
 		const totalCount = consolidatedSettings.length;
 		this._onDidFilterResultsCountChange.fire({ count: totalCount });
 	}
